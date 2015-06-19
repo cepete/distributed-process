@@ -67,7 +67,7 @@ import Control.Exception
   , uninterruptibleMask_
   )
 import qualified Control.Exception as Exception (Handler(..), catches, finally)
-import Control.Concurrent (forkIO, forkIOWithUnmask, killThread, myThreadId)
+import Control.Concurrent (forkIO, forkIOWithUnmask, myThreadId)
 import Control.Distributed.Process.Internal.StrictMVar
   ( newMVar
   , withMVar
@@ -76,6 +76,7 @@ import Control.Distributed.Process.Internal.StrictMVar
   , newEmptyMVar
   , putMVar
   , takeMVar
+  , readMVar
   )
 import Control.Concurrent.Chan (newChan, writeChan, readChan)
 import qualified Control.Concurrent.MVar as MVar (newEmptyMVar, takeMVar)
@@ -118,9 +119,6 @@ import Control.Distributed.Process.Internal.Types
   , LocalNode(..)
   , MxEventBus(..)
   , LocalNodeState(..)
-  , ValidLocalNodeState(..)
-  , withValidLocalState
-  , modifyValidLocalState_
   , LocalProcess(..)
   , LocalProcessState(..)
   , Process(..)
@@ -235,7 +233,7 @@ newLocalNode transport rtable = do
 createBareLocalNode :: NT.EndPoint -> RemoteTable -> IO LocalNode
 createBareLocalNode endPoint rtable = do
     unq <- randomIO
-    state <- newMVar $ LocalNodeValid $ ValidLocalNodeState
+    state <- newMVar LocalNodeState
       { _localProcesses   = Map.empty
       , _localPidCounter  = firstNonReservedProcessId
       , _localPidUnique   = unq
@@ -322,21 +320,12 @@ startServiceProcesses node = do
            sendChan ch ()
        ]
 
--- | Force-close a local node, killing all processes on that node.
+-- | Force-close a local node
+--
+-- TODO: for now we just close the associated endpoint
 closeLocalNode :: LocalNode -> IO ()
-closeLocalNode node = do
-  modifyMVar_ (localState node) $ \st -> case st of
-    LocalNodeValid vst -> do
-      forM_ (vst ^. localProcesses) $ \lproc ->
-        -- Semantics of 'throwTo' guarantee that target thread will get
-        -- delivered an exception. Therefore, target thread will be killed
-        -- eventually and that's as good as we can do. No need to wait for
-        -- thread to actually finish dying.
-        killThread (processThread lproc)
-      return LocalNodeClosed
-    LocalNodeClosed -> return LocalNodeClosed
-  -- This call will have the effect of shutting down the NC as well (see
-  -- 'createBareLocalNode').
+closeLocalNode node =
+  -- TODO: close all our processes, surely!?
   NT.closeEndPoint (localEndPoint node)
 
 -- | Run a process on a local node and wait for it to finish
@@ -355,9 +344,9 @@ forkProcess node proc =
     modifyMVarMasked (localState node) startProcess
   where
     startProcess :: LocalNodeState -> IO (LocalNodeState, ProcessId)
-    startProcess (LocalNodeValid vst) = do
-      let lpid  = LocalProcessId { lpidCounter = vst ^. localPidCounter
-                                 , lpidUnique  = vst ^. localPidUnique
+    startProcess st = do
+      let lpid  = LocalProcessId { lpidCounter = st ^. localPidCounter
+                                 , lpidUnique  = st ^. localPidUnique
                                  }
       let pid   = ProcessId { processNodeId  = localNodeId node
                             , processLocalId = lpid
@@ -389,7 +378,7 @@ forkProcess node proc =
                 (return . DiedException . (show :: SomeException -> String)))]
 
           -- [Unified: Table 4, rules termination and exiting]
-          modifyValidLocalState_ node (cleanupProcess pid)
+          modifyMVar_ (localState node) (cleanupProcess pid)
           writeChan (localCtrlChan node) NCMsg
             { ctrlMsgSender = ProcessIdentifier pid
             , ctrlMsgSignal = Died (ProcessIdentifier pid) reason
@@ -404,30 +393,27 @@ forkProcess node proc =
           -- TODO: this doesn't look right at all - how do we know
           -- that newUnique represents a process id that is available!?
           newUnique <- randomIO
-          return ( LocalNodeValid
-                 $ (localProcessWithId lpid ^= Just lproc)
+          return ( (localProcessWithId lpid ^= Just lproc)
                  . (localPidCounter ^= firstNonReservedProcessId)
                  . (localPidUnique ^= newUnique)
-                 $ vst
+                 $ st
                  , pid
                  )
         else
-          return ( LocalNodeValid
-                 $ (localProcessWithId lpid ^= Just lproc)
+          return ( (localProcessWithId lpid ^= Just lproc)
                  . (localPidCounter ^: (+ 1))
-                 $ vst
+                 $ st
                  , pid
                  )
-    startProcess LocalNodeClosed = throwIO $ userError $ "Node closed " ++ show (localNodeId node)
 
-    cleanupProcess :: ProcessId -> ValidLocalNodeState -> IO ValidLocalNodeState
-    cleanupProcess pid vst = do
+    cleanupProcess :: ProcessId -> LocalNodeState -> IO LocalNodeState
+    cleanupProcess pid st = do
       let pid' = ProcessIdentifier pid
-      let (affected, unaffected) = Map.partitionWithKey (\(fr, _to) !_v -> impliesDeathOf pid' fr) (vst ^. localConnections)
+      let (affected, unaffected) = Map.partitionWithKey (\(fr, _to) !_v -> impliesDeathOf pid' fr) (st ^. localConnections)
       mapM_ (NT.close . fst) (Map.elems affected)
       return $ (localProcessWithId (processLocalId pid) ^= Nothing)
              . (localConnections ^= unaffected)
-             $ vst
+             $ st
 
 -- note [tracer/forkProcess races]
 --
@@ -516,7 +502,7 @@ handleIncomingMessages node = go initConnectionState
               case decode (BSL.fromChunks payload) of
                 ProcessIdentifier pid -> do
                   let lpid = processLocalId pid
-                  mProc <- withValidLocalState node $ return . (^. localProcessWithId lpid)
+                  mProc <- withMVar state $ return . (^. localProcessWithId lpid)
                   case mProc of
                     Just proc ->
                       go (incomingAt cid ^= Just (src, ToProc pid (processWeakQ proc)) $ st)
@@ -525,7 +511,7 @@ handleIncomingMessages node = go initConnectionState
                 SendPortIdentifier chId -> do
                   let lcid = sendPortLocalId chId
                       lpid = processLocalId (sendPortProcessId chId)
-                  mProc <- withValidLocalState node $ return . (^. localProcessWithId lpid)
+                  mProc <- withMVar state $ return . (^. localProcessWithId lpid)
                   case mProc of
                     Just proc -> do
                       mChannel <- withMVar (processState proc) $ return . (^. typedChannelWithId lcid)
@@ -992,8 +978,8 @@ ncEffectGetInfo from pid =
       them = (ProcessIdentifier pid)
   in do
   node <- ask
-  mProc <- liftIO $ withValidLocalState node
-                  $ return . (^. localProcessWithId lpid)
+  mProc <- liftIO $
+            withMVar (localState node) $ return . (^. localProcessWithId lpid)
   case mProc of
     Nothing   -> dispatch (isLocal node (ProcessIdentifier from))
                           from node (ProcessInfoNone DiedUnknownId)
@@ -1036,17 +1022,17 @@ ncEffectGetNodeStats :: ProcessId -> NodeId -> NC ()
 ncEffectGetNodeStats from _nid = do
   node <- ask
   ncState <- StateT.get
-  nodeState <- liftIO $ withValidLocalState node return
-  let stats =
+  nodeState <- liftIO $ readMVar (localState node)
+  let localProcesses' = nodeState ^. localProcesses
+      stats =
         NodeStats {
             nodeStatsNode = localNodeId node
           , nodeStatsRegisteredNames = Map.size $ ncState ^. registeredHere
           , nodeStatsMonitors = Map.size $ ncState ^. monitors
           , nodeStatsLinks = Map.size $ ncState ^. links
-          , nodeStatsProcesses = Map.size (nodeState ^. localProcesses)
+          , nodeStatsProcesses = Map.size localProcesses'
           }
   postAsMessage from stats
-
 --------------------------------------------------------------------------------
 -- Auxiliary                                                                  --
 --------------------------------------------------------------------------------
@@ -1119,7 +1105,7 @@ unClosure closure = do
 isValidLocalIdentifier :: Identifier -> NC Bool
 isValidLocalIdentifier ident = do
   node <- ask
-  liftIO . withValidLocalState node $ \nSt ->
+  liftIO . withMVar (localState node) $ \nSt ->
     case ident of
       NodeIdentifier nid ->
         return $ nid == localNodeId node
@@ -1159,8 +1145,8 @@ withLocalProc node pid p =
   -- By [Unified: table 6, rule missing_process] messages to dead processes
   -- can silently be dropped
   let lpid = processLocalId pid in do
-  withValidLocalState node $ \vst ->
-    forM_ (vst ^. localProcessWithId lpid) p
+  mProc <- withMVar (localState node) $ return . (^. localProcessWithId lpid)
+  forM_ mProc p
 
 --------------------------------------------------------------------------------
 -- Accessors                                                                  --

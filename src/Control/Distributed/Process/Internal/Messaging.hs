@@ -13,6 +13,7 @@ import Data.Binary (Binary, encode)
 import qualified Data.Map as Map (partitionWithKey, elems)
 import qualified Data.ByteString.Lazy as BSL (toChunks)
 import qualified Data.ByteString as BSS (ByteString)
+import Control.Distributed.Process.Internal.StrictMVar (withMVar, modifyMVar_)
 import Control.Distributed.Process.Serializable ()
 
 import Control.Concurrent.Chan (writeChan)
@@ -29,8 +30,6 @@ import qualified Network.Transport as NT
   )
 import Control.Distributed.Process.Internal.Types
   ( LocalNode(localState, localEndPoint, localCtrlChan)
-  , withValidLocalState
-  , modifyValidLocalState_
   , Identifier
   , localConnections
   , localConnectionBetween
@@ -103,7 +102,7 @@ setupConnBetween :: LocalNode
                  -> ImplicitReconnect
                  -> IO (Maybe NT.Connection)
 setupConnBetween node from to implicitReconnect = do
-    mConn <- NT.connect (localEndPoint node)
+    mConn <- NT.connect endPoint
                         (nodeAddress . nodeOf $ to)
                         NT.ReliableOrdered
                         NT.defaultConnectHints
@@ -114,11 +113,14 @@ setupConnBetween node from to implicitReconnect = do
           Left _ ->
             return Nothing
           Right () -> do
-            modifyValidLocalState_ node $
-              return . (localConnectionBetween from to ^= Just (conn, implicitReconnect))
+            modifyMVar_ nodeState $ return .
+              (localConnectionBetween from to ^= Just (conn, implicitReconnect))
             return $ Just conn
       Left _ ->
         return Nothing
+  where
+    endPoint  = localEndPoint node
+    nodeState = localState node
 
 connBetween :: LocalNode
             -> Identifier
@@ -126,33 +128,33 @@ connBetween :: LocalNode
             -> ImplicitReconnect
             -> IO (Maybe NT.Connection)
 connBetween node from to implicitReconnect = do
-    mConn <- withValidLocalState node $
-      return . (^. localConnectionBetween from to)
+    mConn <- withMVar nodeState $ return . (^. localConnectionBetween from to)
     case mConn of
       Just (conn, _) ->
         return $ Just conn
       Nothing ->
         setupConnBetween node from to implicitReconnect
+  where
+    nodeState = localState node
 
 disconnect :: LocalNode -> Identifier -> Identifier -> IO ()
 disconnect node from to =
-  modifyValidLocalState_ node $ \vst ->
-    case vst ^. localConnectionBetween from to of
+  modifyMVar_ (localState node) $ \st ->
+    case st ^. localConnectionBetween from to of
       Nothing ->
-        return vst
+        return st
       Just (conn, _) -> do
         NT.close conn
-        return $ localConnectionBetween from to ^= Nothing $ vst
+        return (localConnectionBetween from to ^= Nothing $ st)
 
 closeImplicitReconnections :: LocalNode -> Identifier -> IO ()
 closeImplicitReconnections node to =
-  modifyValidLocalState_ node $ \vst -> do
+  modifyMVar_ (localState node) $ \st -> do
     let shouldClose (_, to') (_, WithImplicitReconnect) = to `impliesDeathOf` to'
         shouldClose _ _ = False
-    let (affected, unaffected) =
-          Map.partitionWithKey shouldClose (vst ^. localConnections)
+    let (affected, unaffected) = Map.partitionWithKey shouldClose (st ^. localConnections)
     mapM_ (NT.close . fst) (Map.elems affected)
-    return $ localConnections ^= unaffected $ vst
+    return (localConnections ^= unaffected $ st)
 
 -- | @a `impliesDeathOf` b@ is true if the death of @a@ (for instance, a node)
 -- implies the death of @b@ (for instance, a process on that node)
